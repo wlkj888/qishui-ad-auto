@@ -36,10 +36,16 @@ KS_LIVE_TEXT = ("正在直播", "直播中", "进入直播间", "来看直播", 
 # ---------- 默认参数 ----------
 DEFAULT_WATCH = 25.0      # 兼容参数：GUI 里"每条停留"输入框的值（现在仅作参考，不再按时间刷走）
 MIN_WATCH = 2.0           # 播完判定生效前最少观看秒数（防止刚切换转场时误判）
-LOOP_DIFF_THRESH = 13.0   # 首尾帧平均灰度差小于此值 → 认为循环回到开头（看完了）
-STATIC_DIFF_THRESH = 2.2  # 相邻帧平均灰度差小于此值 → 画面静止（作品播完停在末帧）
+MIN_PLAY_SEC = 8.0        # 任何"播完"判定的最低观看时长：不足 8 秒绝不判播完（防秒刷）
+LOOP_DIFF_THRESH = 6.0    # 首尾帧灰度差阈值（收紧，13 太松会把慢节奏作品误判成循环）
+LOOP_MIN_SEC = 12.0       # 循环检测至少看满 12 秒才允许判定
+STATIC_DIFF_THRESH = 2.2  # 相邻帧灰度差小于此值 → 画面静止（作品播完停在末帧）
 STATIC_SAMPLES = 10       # 连续静止采样次数（约 0.25s/次 → 约 2.5 秒静止算播完）
+STATIC_MIN_SEC = 10.0     # 静止判定至少看满 10 秒才允许
 RP_STABLE_N = 6           # 红包进度环连续 N 次不增长（约 6 次轮询）判定进度停=看完
+RP_RISE_MIN = 0.55        # 红包环须先观测到低于此值，才承认"本条在涨"（恒满时不启用该判据）
+COMMENT_GAP_MIN = 5       # 两次评论之间最少刷 5 条作品
+COMMENT_GAP_MAX = 20      # 最多刷 20 条，间隔随机、不频繁
 HARD_TIMEOUT = 300        # 异常卡死兜底：单条 5 分钟还没检测到播完才强制下一条（正常不会触发）
 KS_PKG = "com.smile.gifmaker"
 
@@ -141,7 +147,8 @@ def _launch(G) -> None:
 
 def run(app, G, watch_seconds: float = DEFAULT_WATCH,
         watch_phase_min: float = 0.0, claim_coins: bool = False,
-        rest_phase_min: float = 0.0, enable_comment: bool = False) -> None:
+        rest_phase_min: float = 0.0, enable_comment: bool = False,
+        coin_mode: bool = False) -> None:
     """
     快手模式主循环（在 GUI 的 worker 线程中运行）。
 
@@ -151,6 +158,7 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
     claim_coins     : 是否启用"领金币阶段"
     rest_phase_min  : 领完金币后休息时长（分钟），到点回来继续刷
     enable_comment  : 是否启用随机自动评论
+    coin_mode       : True=领金币模式（边刷作品边按间隔领金币，领完不休息直接继续刷）
     """
     import kuaishou_coin
     live = None
@@ -158,6 +166,10 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
     try:
         watch = float(watch_seconds or DEFAULT_WATCH)
         watch = max(6.0, min(watch, 180.0))
+        # 领金币模式：强制开启定时、领完立即继续刷（休息 0）
+        if coin_mode:
+            claim_coins = True
+            rest_phase_min = 0.0
         schedule_on = claim_coins and watch_phase_min > 0
         sched = {
             "phase": "watch",                 # watch / claim / rest
@@ -165,7 +177,9 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
             "coin_rounds": 0,
         }
         _log(app, "快手模式启动：每条作品播完（画面停止/红包进度停）才上滑下一条，没播完就一直等；直播自动跳过", "info")
-        if schedule_on:
+        if coin_mode:
+            _log(app, f"领金币模式：边刷作品边计金币，每刷 {watch_phase_min:.0f} 分钟领一次，领完立刻继续刷", "info")
+        elif schedule_on:
             _log(app, f"定时循环已开启：刷 {watch_phase_min:.0f} 分钟 → 领金币 → "
                       f"休息 {rest_phase_min:.0f} 分钟 → 继续刷", "info")
 
@@ -278,10 +292,25 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
         loop_ref = None       # 循环检测基准帧（观看约2秒锁定，回到相似画面=播完）
         static_count = 0
         rp_prev = None        # 上一次红包进度值
-        rp_stable = 0         # 红包进度环"不再增长"的连续次数（=看完了）
-        comment_after = random.randint(3, 7)   # 再刷几条后触发一次随机评论
+        rp_low_seen = False   # 本条是否观测到红包环处于低位（用于区分"恒满"与"本条涨满"）
+        comment_after = random.randint(COMMENT_GAP_MIN, COMMENT_GAP_MAX)  # 首条评论前先刷随机条数
+        last_comment_at = 0.0                  # 上次评论时间，防止连发
+        COMMENT_COOLDOWN = 30.0                # 两次评论最少间隔 30 秒
         last_ocr = 0.0
         last_report = 0.0
+
+        def reset_video_state():
+            """切换作品/阶段后重置本条的所有判定状态。"""
+            nonlocal current_start, first_thumb, prev_thumb, loop_ref
+            nonlocal static_count, rp_prev, rp_stable, rp_low_seen
+            current_start = time.time()
+            first_thumb = None
+            prev_thumb = None
+            loop_ref = None
+            static_count = 0
+            rp_prev = None
+            rp_stable = 0
+            rp_low_seen = False
 
         while not stop.is_set():
             now = time.time()
@@ -295,6 +324,13 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                     sched["coin_rounds"] += 1
                     _log(app, f"第 {sched['coin_rounds']} 次领金币完成（红包{r['big_packet']}/"
                               f"任务{r['task_claims']}/弹窗{r['popups']}）", "info")
+                    if coin_mode:
+                        # 领金币模式：领完立刻回到刷视频，不休息、不重启快手
+                        sched["phase"] = "watch"
+                        sched["phase_end"] = time.time() + watch_phase_min * 60
+                        reset_video_state()
+                        _log(app, "领金币完成，继续刷作品", "info")
+                        continue
                     sched["phase"] = "rest"
                     sched["phase_end"] = time.time() + rest_phase_min * 60
                     if rest_phase_min > 0:
@@ -309,13 +345,7 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                     time.sleep(1.0)
                     sched["phase"] = "watch"
                     sched["phase_end"] = time.time() + watch_phase_min * 60
-                    current_start = time.time()
-                    first_thumb = None
-                    prev_thumb = None
-                    loop_ref = None
-                    static_count = 0
-                    rp_prev = None
-                    rp_stable = 0
+                    reset_video_state()
                 continue
 
             # 休息阶段：不做任何操作，只等倒计时
@@ -338,13 +368,7 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 time.sleep(0.4)
                 _launch(G)
                 time.sleep(1.8)
-                current_start = time.time()
-                first_thumb = None
-                prev_thumb = None
-                loop_ref = None
-                static_count = 0
-                rp_prev = None
-                rp_stable = 0
+                reset_video_state()
                 continue
 
             # 直播检测一：Activity 名（最可靠）
@@ -353,13 +377,7 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 _log(app, f"识别到直播间（Activity），快速上滑跳过 · 累计跳过 {skipped_live}", "warn")
                 _swipe_next(G, dev_w, dev_h)
                 app.rounds += 1
-                current_start = time.time()
-                first_thumb = None
-                prev_thumb = None
-                loop_ref = None
-                static_count = 0
-                rp_prev = None
-                rp_stable = 0
+                reset_video_state()
                 time.sleep(1.0)
                 continue
 
@@ -382,13 +400,7 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 time.sleep(0.45)
                 _swipe_next(G, dev_w, dev_h)
                 app.rounds += 1
-                current_start = time.time()
-                first_thumb = None
-                prev_thumb = None
-                loop_ref = None
-                static_count = 0
-                rp_prev = None
-                rp_stable = 0
+                reset_video_state()
                 time.sleep(1.0)
                 continue
 
@@ -401,10 +413,13 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
 
             # ===== 红包进度环检测（主判据，最贴合用户观察）=====
             # 左上角红包的黄色进度环随观看增长，播满后停住不再增长。
-            # 连续 N 次"进度不再增长"（且进度已达高位）即判定这条看完。
+            # 关键：红包环是"今日累计任务进度"，刷满后当天恒满。只有本条观测到
+            # 环从低位(RP_RISE_MIN以下)涨到高位，才承认"本条涨满"；恒满不生效。
             rp = red_packet_progress(frame)
+            if rp is not None and rp < RP_RISE_MIN:
+                rp_low_seen = True
             rp_done = False
-            if rp is not None and elapsed >= MIN_WATCH:
+            if rp is not None and elapsed >= MIN_WATCH and rp_low_seen:
                 if rp_prev is not None and rp >= rp_prev - 0.01 and rp >= 0.85:
                     rp_stable += 1
                 else:
@@ -416,36 +431,33 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 rp_stable = 0
                 rp_prev = rp
 
-            # 画面静止检测（辅助）：作品播完停在末帧
+            # 画面静止检测（辅助）：作品播完停在末帧；至少看满 STATIC_MIN_SEC
             frame_delta = _diff(thumb, prev_thumb) if prev_thumb is not None else 99.0
             prev_thumb = thumb
-            if elapsed >= MIN_WATCH and frame_delta < STATIC_DIFF_THRESH:
+            if elapsed >= STATIC_MIN_SEC and frame_delta < STATIC_DIFF_THRESH:
                 static_count += 1
             else:
                 static_count = 0
 
-            # 循环检测（辅助）：观看约2秒锁定基准帧，之后回到相似画面=播完重播
+            # 循环检测（辅助）：至少看满 LOOP_MIN_SEC，回到相似画面才算播完重播
             loop_hit = False
             if loop_ref is None and elapsed >= 2.0:
                 loop_ref = thumb
-            elif loop_ref is not None and elapsed >= 5.0:
+            elif loop_ref is not None and elapsed >= LOOP_MIN_SEC:
                 if _diff(thumb, loop_ref) < LOOP_DIFF_THRESH:
                     loop_hit = True
 
-            # 判定"这条播完了"：
-            #   A) 红包进度环满且停住（主判据）
-            #   B) 画面连续静止 → 作品播完停在末帧
-            #   C) 循环回到开头 → 作品播完自动重播
-            # 没播完就一直等，绝不按时间提前刷走。仅异常卡死才兜底。
+            # 判定"这条播完了"：任何判据都要先满足最低观看时长 MIN_PLAY_SEC
             done = False
             reason = ""
-            if rp_done:
-                done, reason = True, "红包进度环已满且停止（作品看完）"
-            elif static_count >= STATIC_SAMPLES:
-                done, reason = True, "画面静止（作品已播完）"
-            elif loop_hit:
-                done, reason = True, "画面循环回到开头（作品已播完）"
-            elif elapsed >= HARD_TIMEOUT:
+            if elapsed >= MIN_PLAY_SEC:
+                if rp_done:
+                    done, reason = True, "红包进度环本条涨满且停止（作品看完）"
+                elif static_count >= STATIC_SAMPLES:
+                    done, reason = True, "画面静止（作品已播完）"
+                elif loop_hit:
+                    done, reason = True, "画面循环回到开头（作品已播完）"
+            if elapsed >= HARD_TIMEOUT:  # 异常卡死兜底：5 分钟强制下一条
                 done, reason = True, f"异常卡死兜底（{elapsed:.0f}s 未检测到播完，强制下一条）"
 
             if done:
@@ -454,32 +466,22 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 app.rounds += 1
                 _log(app, f"第 {watched} 条看完（{reason}），上滑下一条", "click")
                 _swipe_next(G, dev_w, dev_h)
-                current_start = time.time()
-                first_thumb = None
-                prev_thumb = None
-                loop_ref = None
-                static_count = 0
-                rp_prev = None
-                rp_stable = 0
+                reset_video_state()
                 time.sleep(random.uniform(0.7, 1.3))
                 continue
 
             # 随机评论：刷了几条后不定时发一条（仅刷视频阶段、非休息/领金币时）
             phase_ok = (not schedule_on) or sched["phase"] == "watch"
-            if enable_comment and phase_ok and watched >= comment_after:
+            if (enable_comment and phase_ok and watched >= comment_after
+                    and now - last_comment_at >= COMMENT_COOLDOWN):
                 try:
                     import kuaishou_comment
                     kuaishou_comment.post_comment(app, G, live, dev_w, dev_h)
                 except Exception as e:
                     _log(app, f"[评论] 跳过: {e}", "warn")
-                comment_after = watched + random.randint(3, 7)
-                first_thumb = None
-                prev_thumb = None
-                loop_ref = None
-                static_count = 0
-                rp_prev = None
-                rp_stable = 0
-                current_start = time.time()
+                last_comment_at = time.time()
+                comment_after = watched + random.randint(COMMENT_GAP_MIN, COMMENT_GAP_MAX)
+                reset_video_state()
                 continue
 
             # 每 3 秒汇报一次进度
@@ -528,172 +530,14 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
 
 def run_coin_only(app, G, interval_min: float = 5.0) -> None:
     """
-    独立"只领金币"模式：不刷视频，只周期性领取现成金币。
-
-    每轮：确保快手在视频页 → claim_once → 等 interval 分钟（可被停止打断）→ 下一轮。
-    完全复用 run() 的设备选择 / OCR / LiveScreen / 预览线程基础设施，
-    但不调用也不修改刷视频主循环，互不干扰。
+    领金币模式：边刷作品、播完才滑、直播跳过，每 interval_min 分钟领一次现成金币，
+    领完立刻继续刷（不休息）。复用 run() 的整套刷视频/判定/评论逻辑，仅调度不同。
     """
-    import kuaishou_coin
-    live = None
-    stop = app.stop_event
     try:
-        interval = float(interval_min or 5.0)
-        interval = max(0.5, min(interval, 240.0))
-        _log(app, f"只领金币模式：每 {interval:.1f} 分钟领一次现成金币，不刷视频", "info")
-
-        # ---- 设备（与 run 一致）----
-        out = G.run_adb_text(["devices"])
-        lines = [ln.strip() for ln in out.splitlines()[1:] if ln.strip()]
-        ready = [ln.split()[0] for ln in lines if ln.endswith("device")]
-        if not ready:
-            host = G.load_wifi_ip()
-            if host:
-                _log(app, f"未发现设备，尝试连接记忆中的 {host}", "warn")
-                G.run_adb_host(["connect", host], timeout=12)
-                time.sleep(1.5)
-                out = G.run_adb_text(["devices"])
-                ready = [ln.split()[0] for ln in out.splitlines()[1:]
-                         if ln.strip() and ln.endswith("device")]
-        if not ready:
-            _log(app, "未检测到已授权设备，请开启 USB 调试 / 连上 WiFi ADB", "err")
-            app.msg_q.put(("stopped",))
-            return
-
-        serial = getattr(G, "DEVICE_SERIAL", None)
-
-        def has_kuaishou(sn: str) -> bool:
-            try:
-                import subprocess
-                r = subprocess.run([G.ADB, "-s", sn, "shell", "pm", "list",
-                                    "packages", KS_PKG],
-                                   capture_output=True, timeout=8)
-                return KS_PKG in (r.stdout or b"").decode("utf-8", errors="replace")
-            except Exception:
-                return False
-
-        chosen = serial if (serial in ready and has_kuaishou(serial)) else None
-        if chosen is None:
-            for sn in ready:
-                if has_kuaishou(sn):
-                    chosen = sn
-                    break
-        if chosen is not None and chosen != serial:
-            _log(app, f"自动切换到装有快手的设备 {chosen}", "warn")
-        serial = chosen or (serial if serial in ready else ready[0])
-        G.DEVICE_SERIAL = serial
-        _log(app, f"目标设备 {serial}", "info")
-
-        dev_w, dev_h = G.get_device_size()
-        G.SCREEN_W, G.SCREEN_H = dev_w, dev_h
-        scale = 0.5 if dev_w >= 1000 else 1.0
-        stream_w = int(dev_w * scale) // 2 * 2
-        stream_h = int(dev_h * scale) // 2 * 2
-        _log(app, f"真机分辨率 {dev_w}x{dev_h} · 影像流 {stream_w}x{stream_h}", "info")
-
-        # ---- OCR / 影像 ----
-        _log(app, "加载 OCR 模型…", "info")
-        G.get_ocr()
-        try:
-            G.run_adb_text(["shell", "svc", "power", "stayon", "true"])
-        except Exception:
-            pass
-        live = G.LiveScreen(
-            G.ADB, serial, size=f"{stream_w}x{stream_h}",
-            on_log=lambda s: app.msg_q.put(("log", s, "info")),
-            screen_off=False,
-        )
-        live.start()
-
-        def _preview_loop():
-            last_seq = -1
-            while not stop.is_set():
-                try:
-                    seq = live.latest_seq()
-                    if seq != last_seq:
-                        frame = live.latest()
-                        if frame is not None:
-                            if app.frame_q.full():
-                                try:
-                                    app.frame_q.get_nowait()
-                                except Exception:
-                                    pass
-                            try:
-                                app.frame_q.put_nowait(frame)
-                            except Exception:
-                                pass
-                            last_seq = seq
-                except Exception:
-                    pass
-                time.sleep(0.012)
-
-        threading.Thread(target=_preview_loop, daemon=True).start()
-
-        # ---- 确保快手在前台 ----
-        focus = G.current_focus()
-        if KS_PKG not in (focus or ""):
-            _log(app, "快手不在前台，正在拉起…", "info")
-            _launch(G)
-            time.sleep(2.5)
-
-        # ---- 领金币循环 ----
-        rounds = 0
-        started_at = time.time()
-        while not stop.is_set():
-            focus = G.current_focus()
-            if KS_PKG not in (focus or ""):
-                _log(app, "已离开快手，重新拉起…", "warn")
-                _launch(G)
-                time.sleep(2.5)
-            focus = G.current_focus()
-            if KS_PKG not in (focus or ""):
-                _log(app, "无法把快手切到前台，20 秒后重试", "err")
-                for _ in range(200):
-                    if stop.is_set():
-                        break
-                    time.sleep(0.1)
-                continue
-
-            kuaishou_coin.claim_once._clicked = set()
-            r = kuaishou_coin.claim_once(app, G, live, dev_w, dev_h)
-            rounds += 1
-            app.rounds += 1
-            detail = (f"第 {rounds} 次领金币（红包{r['big_packet']}/"
-                      f"任务{r['task_claims']}/弹窗{r['popups']}）")
-            _log(app, detail, "info")
-            app.msg_q.put((
-                "stat", app.clicks, app.rounds, time.time() - started_at,
-                f"快手 · 只领金币 · 已领 {rounds} 轮 · {r['coins_hint']}",
-            ))
-
-            # 等待间隔，每 0.5 秒检查停止信号，保证暂停/停止即时生效
-            waited = 0.0
-            while not stop.is_set() and waited < interval * 60:
-                time.sleep(0.5)
-                waited += 0.5
-                if int(waited) % 60 == 0 and int(waited) > 0:
-                    left = (interval * 60 - waited) / 60
-                    _log(app, f"距下次领金币还有 {left:.1f} 分钟", "info")
-
-    except Exception as e:
-        _log(app, f"只领金币模式异常: {type(e).__name__}: {e}", "err")
-    finally:
-        if live is not None:
-            try:
-                live.stop()
-            except Exception:
-                pass
-        try:
-            for _ in range(6):
-                f = G.current_focus() or ""
-                if KS_PKG not in f:
-                    break
-                act = f.lower()
-                if "homeactivity" in act or "photodetailactivity" in act:
-                    break
-                G.press_back()
-                time.sleep(0.5)
-        except Exception:
-            pass
-        if stop.is_set():
-            app.msg_q.put(("stopped",))
+        gap = float(interval_min or 5.0)
+    except Exception:
+        gap = 5.0
+    # 复用主循环；coin_mode=True 时 run 内部强制开启定时领金币、领完不休息
+    run(app, G, watch_seconds=DEFAULT_WATCH,
+        watch_phase_min=gap, claim_coins=True, rest_phase_min=0.0,
+        enable_comment=False, coin_mode=True)

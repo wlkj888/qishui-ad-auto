@@ -113,6 +113,18 @@ def post_comment(app, G, live, dev_w: int, dev_h: int) -> bool:
                 pass
 
         # 2) 找输入框：识别"说点什么/评论"等提示，找不到就用比例坐标兜底
+        #    若误进"回复给 XXX"状态，先按返回取消回复，确保发的是独立评论
+        reply_hint = _find_ocr(boxes, ("回复给", "回复 @", "回复评论"))
+        if reply_hint is not None:
+            _log(app, "[评论] 检测到回复态，先取消", "warn")
+            G.press_back()
+            time.sleep(0.6)
+            frame = live.latest()
+            if frame is not None:
+                try:
+                    boxes = G.run_ocr(frame)
+                except Exception:
+                    boxes = []
         box_in = _find_ocr(boxes, ("说点什么", "写评论", "评论一句", "留下你的",
                                    "抢沙发", "暖评", "我先来", "評論"),
                            prefer_bottom=True)
@@ -153,13 +165,31 @@ def post_comment(app, G, live, dev_w: int, dev_h: int) -> bool:
         _log(app, f"[评论] 失败: {type(e).__name__}: {e}，跳过", "warn")
     finally:
         # 5) 关闭评论区回到视频页
-        for _ in range(3):
-            f = G.current_focus() or ""
-            act = f.lower()
-            if "homeactivity" in act or "photodetailactivity" in act:
+        # 注意：快手评论区是盖在 HomeActivity 上的弹层，Activity 名仍是 homeactivity，
+        # 不能用 Activity 名判断（会误以为已经在视频页而一次返回都不按 → 卡在评论区连发）。
+        # 改用画面 OCR：看到评论区特征文字就按返回，直到特征消失。
+        PANEL_WORDS = ("条评论", "说点什么", "写评论", "留下你的", "抢沙发",
+                       "发表评论", "全部评论", "评论一句", "暖评")
+        for _ in range(6):
+            time.sleep(0.4)
+            f = live.latest()
+            in_panel = False
+            if f is not None:
+                try:
+                    bxs = G.run_ocr(f) or []
+                    in_panel = any(any(w in (b.text or "") for w in PANEL_WORDS)
+                                   for b in bxs)
+                except Exception:
+                    in_panel = False
+            focus = (G.current_focus() or "").lower()
+            # 离开快手就别再按返回（否则会退回桌面），交给主循环拉起
+            if "gifmaker" not in focus:
+                _log(app, "[评论] 已离开快手，停止返回", "warn")
+                break
+            if not in_panel:
                 break
             G.press_back()
-            time.sleep(0.5)
+        _log(app, "[评论] 已关闭评论区回到视频流", "info")
     return ok
 
 
