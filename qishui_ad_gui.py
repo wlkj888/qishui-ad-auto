@@ -875,7 +875,7 @@ class App(tk.Tk):
                 for key in ("rule", "timer", "phases", "comment"):
                     self.ks_rows[key].pack_forget()
                 self.coin_gap_row.pack(fill="x", pady=(4, 0))
-                self.log("已切到【快手·只领金币】：只循环领金币、不刷视频，请点▶启动", "info")
+                self.log("已切到【快手·只领金币】：边刷作品边计金币，每 N 分钟领一次，请点▶启动", "info")
             else:
                 self.coin_gap_row.pack_forget()
                 self.ks_rows["rule"].pack(fill="x", pady=(0, 4))
@@ -1262,7 +1262,7 @@ class App(tk.Tk):
         self.btn_stop.configure(state="normal")
         self.status_var.set("运行中…")
         if self._is_coin_only():
-            self.log("启动【快手·只领金币】（不刷视频）", "info")
+            self.log("启动【快手·只领金币】（边刷边领，播完才滑）", "info")
             self.worker = threading.Thread(target=self._coin_worker_loop, daemon=True)
         elif self._is_kuaishou():
             self.log("启动【快手·自动刷作品】（实时影像）", "info")
