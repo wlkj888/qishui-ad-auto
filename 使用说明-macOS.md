@@ -7,9 +7,9 @@
 | 项目 | 状态 |
 |---|---|
 | 代码 | `~/Doubao/chats/2026-11-20/new-chat/qishui-ad-auto` |
-| 应用名称 | 汽水音乐去广告（窗口标题、Dock 名称、菜单栏一致） |
+| 应用名称 | 汽水快手自动化（窗口标题、Dock 名称、菜单栏一致） |
 | 图标 | `assets/icon_1024.png`（黑底白标单色，只有黑白两色，不是官方彩色版；彩色旧版备份在 `assets/icon_color_1024.png`），已转 `assets/AppIcon.icns` 并打进 .app |
-| .app 包 | `汽水音乐去广告.app`（双击即开，带独立图标与名字） |
+| .app 包 | `汽水快手自动化.app`（双击即开，带独立图标与名字） |
 | Python | 3.12.14（uv 管理），独立虚拟环境 `.venv` |
 | 依赖 | opencv-python 5.1.0 / numpy 2.5.5 / Pillow 13.0 / rapidocr-onnxruntime 1.4.4（onnxruntime 1.32，arm64 原生） |
 | adb | 已存在：`/Users/xiaowu/.local/bin/adb`（v1.0.41 / 37.0.1） |
@@ -18,13 +18,13 @@
 
 ## 启动方式
 
-双击 `汽水音乐去广告.app`（推荐），或双击 `启动.command`（它会去打开这个 .app）。
+双击 `汽水快手自动化.app`（推荐），或双击 `启动.command`（它会去打开这个 .app）。
 
 终端启动：
 
 ```bash
 cd ~/Doubao/chats/2026-11-20/new-chat/qishui-ad-auto
-open "汽水音乐去广告.app"
+open "汽水快手自动化.app"
 # 直接跑源码：.venv/bin/python qishui_ad_gui.py
 ```
 

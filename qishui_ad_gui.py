@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-汽水音乐去广告 GUI 版
+汽水快手自动化 GUI 版
 实时手机截图预览 + OCR 识别信息 + 自动点击 + 运行日志
 """
 
@@ -598,7 +598,7 @@ except Exception as e:  # pragma: no cover
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("汽水音乐去广告")
+        self.title("汽水快手自动化")
         self.geometry("1180x760")
         self.minsize(980, 640)
         self.configure(bg="#1e1f26")
@@ -627,6 +627,7 @@ class App(tk.Tk):
         self.ks_watch_phase_var = tk.StringVar(value="60")  # 刷视频阶段分钟，到点领金币
         self.ks_rest_phase_var = tk.StringVar(value="10")   # 领金币后休息分钟
         self.ks_claim_var = tk.BooleanVar(value=True)       # 是否启用定时领金币
+        self.ks_comment_var = tk.BooleanVar(value=False)     # 是否启用随机自动评论
 
         self._build_style()
         self._build_ui()
@@ -637,7 +638,7 @@ class App(tk.Tk):
         self.after(400, self._refresh_device_info)
         self.after(8000, self._schedule_device_info)
         self.after(600, self._autoconnect_once)
-        self.after(2500, self._autostart_once)
+        # 不再自动启动：必须用户手动点「▶ 启动」才执行任何脚本
 
     # ---------- 图标 ----------
     def _set_window_icon(self):
@@ -672,7 +673,7 @@ class App(tk.Tk):
         # 顶栏
         top = ttk.Frame(self, padding=(12, 10))
         top.pack(fill="x")
-        ttk.Label(top, text="自动化工具", style="Header.TLabel").pack(side="left")
+        ttk.Label(top, text="汽水快手自动化", style="Header.TLabel").pack(side="left")
         # 模式选择
         mode_box = ttk.Frame(top)
         mode_box.pack(side="left", padx=(16, 0))
@@ -737,9 +738,8 @@ class App(tk.Tk):
         self.ks_frame = ttk.LabelFrame(right, text="快手设置", padding=8)
         ks_row1 = ttk.Frame(self.ks_frame)
         ks_row1.pack(fill="x", pady=(0, 4))
-        ttk.Label(ks_row1, text="每条停留(秒):").pack(side="left")
-        ttk.Entry(ks_row1, textvariable=self.ks_watch_var, width=6).pack(side="left", padx=4)
-        ttk.Label(ks_row1, text="播完自动上滑，到点兜底", foreground="#9aa3b2").pack(side="left")
+        ttk.Label(ks_row1, text="刷视频规则：本条播完（画面停止/红包进度停）才上滑，没播完就一直等",
+                  foreground="#9aa3b2", wraplength=400).pack(side="left")
         ks_row2 = ttk.Frame(self.ks_frame)
         ks_row2.pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(ks_row2, text="定时领金币循环", variable=self.ks_claim_var,
@@ -752,7 +752,11 @@ class App(tk.Tk):
         ttk.Label(ks_row3, text="休息(分):").pack(side="left")
         self.ks_rest_phase_entry = ttk.Entry(ks_row3, textvariable=self.ks_rest_phase_var, width=5)
         self.ks_rest_phase_entry.pack(side="left", padx=4)
-        ttk.Label(self.ks_frame, text="到点自动点红包领金币 → 休息 → 继续刷；直播自动跳过",
+        ks_row4 = ttk.Frame(self.ks_frame)
+        ks_row4.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(ks_row4, text="随机自动评论（每刷几条随机发一条常规评论）",
+                        variable=self.ks_comment_var).pack(side="left")
+        ttk.Label(self.ks_frame, text="播完判定：红包进度环满且停 → 上滑；直播自动跳过；评论需先在手机登录快手",
                   foreground="#9aa3b2", wraplength=400).pack(fill="x", pady=(4, 0))
         if "快手" not in self.mode_var.get():
             self.ks_frame.pack_forget()
@@ -807,13 +811,16 @@ class App(tk.Tk):
         return "快手" in self.mode_var.get()
 
     def _on_mode_change(self, _=None):
-        """切换模式时显示/隐藏快手设置，并给出提示。"""
+        """切换模式时显示/隐藏快手设置；运行中则先停止旧 worker，避免两个模式并存抢流。"""
+        if self.running or (self.worker is not None and self.worker.is_alive()):
+            self.log("切换模式：正在停止当前运行，请再点▶启动以切换到新模式", "warn")
+            self.stop_bot()
         if self._is_kuaishou():
             self.ks_frame.pack(fill="x", pady=(0, 8), before=self._devf)
-            self.log("已切到【快手·自动刷作品】：请先打开快手并登录，点▶启动后自动刷推荐", "info")
+            self.log("已切到【快手·自动刷作品】：请点▶启动开始刷推荐", "info")
         else:
             self.ks_frame.pack_forget()
-            self.log("已切到【汽水音乐·去广告】", "info")
+            self.log("已切到【汽水音乐·去广告】：请点▶启动", "info")
 
     def _on_claim_toggle(self):
         state = "normal" if self.ks_claim_var.get() else "disabled"
@@ -1170,16 +1177,17 @@ class App(tk.Tk):
         threading.Thread(target=work, daemon=True).start()
 
     def _autostart_once(self):
-        """窗口打开后自动开始挂机（按钮仍可随时停止/再启动）。"""
-        try:
-            if not self.running:
-                self.start_bot()
-        except Exception:
-            pass
+        """已废弃：不再开机自启，必须用户手动点「▶ 启动」。保留空方法以兼容。"""
+        pass
 
     def start_bot(self):
         if self.running:
             return
+        # 启动前确保旧 worker 已真正退出，避免新旧两个 worker 抢同一个 scrcpy 流
+        if self.worker is not None and self.worker.is_alive():
+            self.log("等待上一轮运行完全停止…", "warn")
+            self.stop_event.set()
+            self.worker.join(timeout=8)
         self.stop_event.clear()
         self.running = True
         self.clicks = 0
@@ -1198,8 +1206,17 @@ class App(tk.Tk):
 
     def stop_bot(self):
         self.stop_event.set()
+        self.running = False
         self.status_var.set("正在停止…")
         self.log("收到停止指令", "warn")
+        # 在后台等待 worker 真正结束，避免界面卡死；结束由 worker 发 stopped 消息
+        w = self.worker
+        if w is not None and w.is_alive():
+            def _wait():
+                w.join(timeout=15)
+                if w.is_alive():
+                    self.msg_q.put(("log", "停止超时：运行器仍在退出中，请稍候或重启工具", "err"))
+            threading.Thread(target=_wait, daemon=True).start()
 
     def _ks_worker_loop(self):
         """快手模式的常驻守护：单轮异常自动重连重试。"""
@@ -1220,7 +1237,8 @@ class App(tk.Tk):
                 kuaishou_bot.run(self, G, watch_seconds=watch,
                                  watch_phase_min=wphase,
                                  claim_coins=bool(self.ks_claim_var.get()),
-                                 rest_phase_min=rphase)
+                                 rest_phase_min=rphase,
+                                 enable_comment=bool(self.ks_comment_var.get()))
             except Exception as e:
                 self.msg_q.put(("log", f"快手运行器异常: {type(e).__name__}: {e}，5 秒后自动重试", "err"))
             if self.stop_event.is_set():

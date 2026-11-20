@@ -2,7 +2,7 @@
 # macOS 启动脚本：优先打开带图标的 .app，找不到时回退到直接运行源码
 cd "$(dirname "$0")" || exit 1
 
-APP="汽水音乐去广告.app"
+APP="汽水快手自动化.app"
 if [ -d "$APP" ]; then
   open "$APP"
   exit 0

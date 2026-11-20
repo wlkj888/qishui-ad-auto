@@ -3,7 +3,8 @@
 快手自动刷作品模块（双模式附加组件）
 
 规则：
-  1. 每条作品"看完再刷"：以停留时长为主 + 检测画面循环回到开头提前切换（快手作品页无进度条）
+  1. 每条作品"播完再刷"：检测画面停止（红包进度停）/循环回到开头才上滑，没播完就一直等；
+     绝不按时间提前刷走，只有异常卡死 5 分钟才兜底
   2. 刷到直播：按返回 / 上滑快速跳过，不观看、不互动
   3. 只做上滑手势，不点赞、不评论、不关注、不点登录
   4. 与汽水音乐去广告模式共用 ADB / OCR / LiveScreen 基础设施
@@ -33,11 +34,13 @@ KS_LIVE_ACTIVITY = ("live", "liveroom", "liveplay", "liveshow")
 KS_LIVE_TEXT = ("正在直播", "直播中", "进入直播间", "来看直播", "开播中", "直播间", "LIVE")
 
 # ---------- 默认参数 ----------
-DEFAULT_WATCH = 25.0      # 默认每条最长停留秒数（兜底）
-MIN_WATCH = 6.0           # 播完判定生效前最少观看秒数（防止刚切换就误判）
+DEFAULT_WATCH = 25.0      # 兼容参数：GUI 里"每条停留"输入框的值（现在仅作参考，不再按时间刷走）
+MIN_WATCH = 2.0           # 播完判定生效前最少观看秒数（防止刚切换转场时误判）
 LOOP_DIFF_THRESH = 13.0   # 首尾帧平均灰度差小于此值 → 认为循环回到开头（看完了）
 STATIC_DIFF_THRESH = 2.2  # 相邻帧平均灰度差小于此值 → 画面静止（作品播完停在末帧）
 STATIC_SAMPLES = 10       # 连续静止采样次数（约 0.25s/次 → 约 2.5 秒静止算播完）
+RP_STABLE_N = 6           # 红包进度环连续 N 次不增长（约 6 次轮询）判定进度停=看完
+HARD_TIMEOUT = 300        # 异常卡死兜底：单条 5 分钟还没检测到播完才强制下一条（正常不会触发）
 KS_PKG = "com.smile.gifmaker"
 
 
@@ -79,6 +82,45 @@ def _diff(a, b) -> float:
     return float(abs(a - b).mean())
 
 
+def red_packet_progress(frame) -> Optional[float]:
+    """
+    检测左上角红包上方的黄色进度环，返回进度 0.0~1.0；检测不到返回 None。
+
+    实测规律（1080x2340）：红包约在 (88,516)-(156,563)，进度环是红包上方的一段
+    金黄色弧。观看时黄像素从约 90 逐步增长到约 459，播满后稳定不再增长。
+    用"当前黄像素 / 满环像素(≈460)"估算进度。传入帧分辨率任意，按比例换算。
+    """
+    if frame is None:
+        return None
+    h, w = frame.shape[:2]
+    b, g, r = cv2.split(frame)
+    # 红色红包本体：在左上 40%宽 x 45%高内找红色连通块
+    m = ((r > 170) & (g < 120) & (b < 120)).astype("uint8") * 255
+    sub = m[0:int(h * 0.45), 0:int(w * 0.35)]
+    n, lab, stats, cent = cv2.connectedComponentsWithStats(sub)
+    best = None
+    for j in range(1, n):
+        x, y, ww, hh, area = stats[j]
+        if area > 600 and ww > 25 and 20 < hh < 90:
+            best = (x, y, ww, hh)
+            break
+    if best is None:
+        return None
+    x, y, ww, hh = best
+    # 红包上方区域的金黄色像素（进度环）
+    yellow = ((r > 190) & (g > 140) & (g < 235) & (b < 130)).astype("uint8")
+    y0 = max(0, y - 40)
+    y1 = min(h, y + 10)
+    x0 = max(0, x - 30)
+    x1 = min(w, x + ww + 30)
+    cnt = int(yellow[y0:y1, x0:x1].sum())
+    if cnt <= 0:
+        return None
+    # 满环约 459 像素（1080 宽基准）；按宽度缩放
+    full = 459.0 * (w / 1080.0)
+    return min(1.0, cnt / full)
+
+
 def _swipe_next(G, dev_w: int, dev_h: int) -> tuple:
     """上滑切换到下一条作品，带随机起点与时长，模拟真人手势。"""
     x = int(dev_w * 0.5) + random.randint(-24, 24)
@@ -99,15 +141,16 @@ def _launch(G) -> None:
 
 def run(app, G, watch_seconds: float = DEFAULT_WATCH,
         watch_phase_min: float = 0.0, claim_coins: bool = False,
-        rest_phase_min: float = 0.0) -> None:
+        rest_phase_min: float = 0.0, enable_comment: bool = False) -> None:
     """
     快手模式主循环（在 GUI 的 worker 线程中运行）。
 
     app: App 实例；G: 运行中的 GUI 模块（sys.modules[__name__]）
-    watch_seconds   : 每条作品最长停留秒数
+    watch_seconds   : 兼容旧参数（现在按红包进度判定，不再按时间刷走）
     watch_phase_min : 刷视频阶段时长（分钟），到点去领金币；0=不定时
     claim_coins     : 是否启用"领金币阶段"
     rest_phase_min  : 领完金币后休息时长（分钟），到点回来继续刷
+    enable_comment  : 是否启用随机自动评论
     """
     import kuaishou_coin
     live = None
@@ -121,7 +164,7 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
             "phase_end": time.time() + watch_phase_min * 60 if schedule_on else 0,
             "coin_rounds": 0,
         }
-        _log(app, f"快手模式启动：每条最多停留 {watch:.0f} 秒（±25%），直播自动跳过", "info")
+        _log(app, "快手模式启动：每条作品播完（画面停止/红包进度停）才上滑下一条，没播完就一直等；直播自动跳过", "info")
         if schedule_on:
             _log(app, f"定时循环已开启：刷 {watch_phase_min:.0f} 分钟 → 领金币 → "
                       f"休息 {rest_phase_min:.0f} 分钟 → 继续刷", "info")
@@ -230,10 +273,13 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
         skipped_live = 0
         started_at = time.time()
         current_start = time.time()
-        current_target = watch * random.uniform(0.82, 1.18)
         first_thumb = None
         prev_thumb = None
+        loop_ref = None       # 循环检测基准帧（观看约2秒锁定，回到相似画面=播完）
         static_count = 0
+        rp_prev = None        # 上一次红包进度值
+        rp_stable = 0         # 红包进度环"不再增长"的连续次数（=看完了）
+        comment_after = random.randint(3, 7)   # 再刷几条后触发一次随机评论
         last_ocr = 0.0
         last_report = 0.0
 
@@ -266,7 +312,10 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                     current_start = time.time()
                     first_thumb = None
                     prev_thumb = None
+                    loop_ref = None
                     static_count = 0
+                    rp_prev = None
+                    rp_stable = 0
                 continue
 
             # 休息阶段：不做任何操作，只等倒计时
@@ -292,7 +341,10 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 current_start = time.time()
                 first_thumb = None
                 prev_thumb = None
+                loop_ref = None
                 static_count = 0
+                rp_prev = None
+                rp_stable = 0
                 continue
 
             # 直播检测一：Activity 名（最可靠）
@@ -302,10 +354,12 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 _swipe_next(G, dev_w, dev_h)
                 app.rounds += 1
                 current_start = time.time()
-                current_target = watch * random.uniform(0.82, 1.18)
                 first_thumb = None
                 prev_thumb = None
+                loop_ref = None
                 static_count = 0
+                rp_prev = None
+                rp_stable = 0
                 time.sleep(1.0)
                 continue
 
@@ -329,10 +383,12 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 _swipe_next(G, dev_w, dev_h)
                 app.rounds += 1
                 current_start = time.time()
-                current_target = watch * random.uniform(0.82, 1.18)
                 first_thumb = None
                 prev_thumb = None
+                loop_ref = None
                 static_count = 0
+                rp_prev = None
+                rp_stable = 0
                 time.sleep(1.0)
                 continue
 
@@ -343,7 +399,24 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
             if first_thumb is None and elapsed >= 1.0:
                 first_thumb = thumb
 
-            # 画面静止检测：作品播完停在末帧（= 红包加载到位）时，相邻帧几乎不变
+            # ===== 红包进度环检测（主判据，最贴合用户观察）=====
+            # 左上角红包的黄色进度环随观看增长，播满后停住不再增长。
+            # 连续 N 次"进度不再增长"（且进度已达高位）即判定这条看完。
+            rp = red_packet_progress(frame)
+            rp_done = False
+            if rp is not None and elapsed >= MIN_WATCH:
+                if rp_prev is not None and rp >= rp_prev - 0.01 and rp >= 0.85:
+                    rp_stable += 1
+                else:
+                    rp_stable = 0
+                rp_prev = rp
+                if rp_stable >= RP_STABLE_N:
+                    rp_done = True
+            else:
+                rp_stable = 0
+                rp_prev = rp
+
+            # 画面静止检测（辅助）：作品播完停在末帧
             frame_delta = _diff(thumb, prev_thumb) if prev_thumb is not None else 99.0
             prev_thumb = thumb
             if elapsed >= MIN_WATCH and frame_delta < STATIC_DIFF_THRESH:
@@ -351,19 +424,29 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
             else:
                 static_count = 0
 
-            # 判定"看完"：
-            #   A) 画面连续静止 → 作品播完停在末帧（最贴近"红包加载完成"）
-            #   B) 画面循环回到开头 → 作品播完自动重播
-            #   C) 停留达到目标时长 → 兜底，避免个别作品不静止也不循环时卡死
+            # 循环检测（辅助）：观看约2秒锁定基准帧，之后回到相似画面=播完重播
+            loop_hit = False
+            if loop_ref is None and elapsed >= 2.0:
+                loop_ref = thumb
+            elif loop_ref is not None and elapsed >= 5.0:
+                if _diff(thumb, loop_ref) < LOOP_DIFF_THRESH:
+                    loop_hit = True
+
+            # 判定"这条播完了"：
+            #   A) 红包进度环满且停住（主判据）
+            #   B) 画面连续静止 → 作品播完停在末帧
+            #   C) 循环回到开头 → 作品播完自动重播
+            # 没播完就一直等，绝不按时间提前刷走。仅异常卡死才兜底。
             done = False
             reason = ""
-            if static_count >= STATIC_SAMPLES:
+            if rp_done:
+                done, reason = True, "红包进度环已满且停止（作品看完）"
+            elif static_count >= STATIC_SAMPLES:
                 done, reason = True, "画面静止（作品已播完）"
-            elif first_thumb is not None and elapsed >= MIN_WATCH \
-                    and _diff(thumb, first_thumb) < LOOP_DIFF_THRESH:
-                done, reason = True, "作品循环回到开头（已播完）"
-            elif elapsed >= current_target:
-                done, reason = True, f"停留达标 {elapsed:.0f}s"
+            elif loop_hit:
+                done, reason = True, "画面循环回到开头（作品已播完）"
+            elif elapsed >= HARD_TIMEOUT:
+                done, reason = True, f"异常卡死兜底（{elapsed:.0f}s 未检测到播完，强制下一条）"
 
             if done:
                 watched += 1
@@ -372,11 +455,31 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                 _log(app, f"第 {watched} 条看完（{reason}），上滑下一条", "click")
                 _swipe_next(G, dev_w, dev_h)
                 current_start = time.time()
-                current_target = watch * random.uniform(0.82, 1.18)
                 first_thumb = None
                 prev_thumb = None
+                loop_ref = None
                 static_count = 0
+                rp_prev = None
+                rp_stable = 0
                 time.sleep(random.uniform(0.7, 1.3))
+                continue
+
+            # 随机评论：刷了几条后不定时发一条（仅刷视频阶段、非休息/领金币时）
+            phase_ok = (not schedule_on) or sched["phase"] == "watch"
+            if enable_comment and phase_ok and watched >= comment_after:
+                try:
+                    import kuaishou_comment
+                    kuaishou_comment.post_comment(app, G, live, dev_w, dev_h)
+                except Exception as e:
+                    _log(app, f"[评论] 跳过: {e}", "warn")
+                comment_after = watched + random.randint(3, 7)
+                first_thumb = None
+                prev_thumb = None
+                loop_ref = None
+                static_count = 0
+                rp_prev = None
+                rp_stable = 0
+                current_start = time.time()
                 continue
 
             # 每 3 秒汇报一次进度
@@ -389,7 +492,8 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
                         phase_txt = f"休息 {remain/60:.1f}分"
                     else:
                         phase_txt = f"刷视频(距领金币 {remain/60:.1f}分)"
-                _log(app, f"[{phase_txt}] 观看 {elapsed:.0f}/{current_target:.0f}s · 已刷 {watched} · 直播跳过 {skipped_live}", "info")
+                play_state = "静止中(将上滑)" if static_count >= STATIC_SAMPLES // 2 else "播放中(等播完)"
+                _log(app, f"[{phase_txt}] 本条已看 {elapsed:.0f}s · {play_state} · 已刷 {watched} · 直播跳过 {skipped_live}", "info")
                 app.msg_q.put((
                     "stat", app.clicks, app.rounds, time.time() - started_at,
                     f"快手 · {phase_txt} · 已刷 {watched} · 直播跳过 {skipped_live} · 金币轮次 {sched['coin_rounds']}",
