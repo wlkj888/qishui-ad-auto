@@ -34,5 +34,6 @@ Thumbs.db
 # 本地备份 / 设备记忆 / 运行日志（不入库）
 _backup_*/
 .last_device
+.last_wifi_ip
 logs/
 scripts/
