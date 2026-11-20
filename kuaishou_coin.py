@@ -42,7 +42,63 @@ def _log(app, msg: str, level: str = "info") -> None:
     app.msg_q.put(("log", msg, level))
 
 
-def _in_task_center(focus: str) -> bool:
+def locate_packet(frame, G, dev_w: int, dev_h: int):
+    """
+    在视频页左上角用颜色检测定位红色红包图标，返回设备坐标 (x, y)。
+    红包是左上角明显的红色块 + 黄色进度环；检测失败时回退到经验坐标。
+    经验值来自真机实测：1080x2340 上红包中心约 (108, 482)。
+    """
+    try:
+        import numpy as np
+        sh, sw = frame.shape[:2]
+        b, g, r = cv2.split(frame)
+        # 红色主体：R 高、G/B 低
+        mask = ((r > 165) & (g < 100) & (b < 100)).astype(np.uint8) * 255
+        # 只在左上区域找：x<30%, y 在 8%~32%（避开顶部菜单和视频主体）
+        x1, x2 = 0, int(sw * 0.30)
+        y1, y2 = int(sh * 0.08), int(sh * 0.32)
+        zone = mask[y1:y2, x1:x2]
+        n, lab, stats, cent = cv2.connectedComponentsWithStats(zone)
+        # 红包常被中间金色横条分成上下两块红色，取所有合格红色块的面积加权重心，
+        # 落在两块之间才是红包中心（单取某一块会偏上或偏下点到边缘）。
+        tot_a = 0.0
+        sx = sy = 0.0
+        for i in range(1, n):
+            xx, yy, ww, hh, area = int(stats[i][0]), int(stats[i][1]), int(stats[i][2]), int(stats[i][3]), int(stats[i][4])
+            if area < 40 or ww > sw * 0.22 or hh > sh * 0.16:
+                continue
+            cx, cy = cent[i]
+            tot_a += area
+            sx += (cx + x1) * area
+            sy += (cy + y1) * area
+        if tot_a > 0:
+            mx, my = G.map_to_device(sx / tot_a, sy / tot_a, sw, sh, dev_w, dev_h)
+            return int(mx), int(my), "color"
+    except Exception:
+        pass
+    # 回退经验坐标（真机实测 1080x2340 上 (121,522) 可稳定进任务中心）
+    return int(dev_w * 0.112), int(dev_h * 0.223), "fallback"
+
+
+TASK_CENTER_OCR = ("任务中心", "我的金币", "日常任务", "金币商城", "我的现金")
+
+
+def _in_task_center(focus: str, live=None, G=None) -> bool:
+    """
+    判断是否在任务中心。注意：真机任务中心是 HomeActivity 上的页面，
+    Activity 名不含 task/krn 关键词，必须结合画面 OCR 判断，否则会误判"未进入"而退出。
+    """
+    # 画面 OCR 判断（最可靠）
+    if live is not None and G is not None:
+        f = live.latest()
+        if f is not None:
+            try:
+                boxes = G.run_ocr(f) or []
+                if any(any(kw in (b.text or "") for kw in TASK_CENTER_OCR) for b in boxes):
+                    return True
+            except Exception:
+                pass
+    # Activity 名判断（部分机型任务中心是独立 Activity）
     if KS_PKG not in (focus or ""):
         return False
     low = focus.lower()
@@ -116,18 +172,23 @@ def claim_once(app, G, live, dev_w: int, dev_h: int) -> dict:
         if frame is None:
             _log(app, "[金币] 没有实时画面，跳过本轮领取", "warn")
             return stat
-        sh, sw = frame.shape[:2]
-        packet_x, packet_y = G.map_to_device(121, 540, 1080, 2340, dev_w, dev_h) \
-            if (sw, sh) != (1080, 2340) else (121, 540)
-        # 直接用比例定位红包（左上角视频页固定位置）
-        packet_x = int(dev_w * 0.112)
-        packet_y = int(dev_h * 0.231)
-        _log(app, f"[金币] 点击左上角红包 @({packet_x},{packet_y}) 进入任务中心", "click")
-        G.tap(packet_x, packet_y)
-        time.sleep(2.0)
-
-        focus = G.current_focus()
-        if not _in_task_center(focus):
+        # 颜色检测定位红包；失败则用真机实测经验坐标 (121,522)
+        packet_x, packet_y, how = locate_packet(frame, G, dev_w, dev_h)
+        candidates = [(packet_x, packet_y)]
+        # 备选坐标：真机实测可进的 (121,522) 与红包上沿 (108,482)
+        for rx, ry in ((int(dev_w * 0.112), int(dev_h * 0.223)),
+                       (int(dev_w * 0.10), int(dev_h * 0.206))):
+            if all(abs(rx - cx) > 6 or abs(ry - cy) > 6 for cx, cy in candidates):
+                candidates.append((rx, ry))
+        focus = ""
+        for ci, (tx, ty) in enumerate(candidates):
+            _log(app, f"[金币] 点击左上角红包 @({tx},{ty})[{how if ci == 0 else 'retry'}] 进入任务中心", "click")
+            G.tap(tx, ty)
+            time.sleep(2.0)
+            focus = G.current_focus()
+            if _in_task_center(focus, live, G):
+                break
+        if not _in_task_center(focus, live, G):
             _log(app, f"[金币] 未进入任务中心（前台 {focus[-60:]}），本轮跳过", "warn")
             G.press_back()
             time.sleep(0.6)
