@@ -240,3 +240,39 @@ def return_and_check_days(app, G, live, dev_w: int, dev_h: int,
     G.press_back()
     time.sleep(0.8)
     return ("continue", days)
+
+
+def detect_full_days_popup(boxes, target_days: int = 30) -> Optional[str]:
+    """
+    主循环每轮轻量检测：是否出现「第N日畅听」满天数弹窗（账号已满/领满）。
+    命中返回命中的原文（如"第30日畅听"），否则 None。
+    只认强特征"日畅听"+天数，不会误判播放页常驻的"免费听30天"标签。
+    另外兼容"恭喜获得"+"权益截止"+"看N个视频享今日无损音质"这种领满弹窗。
+    """
+    # 强特征：第N日畅听 且 N>=目标
+    hit = check_30day_reached(boxes, target_days)
+    if hit:
+        return hit
+    texts = [(b.text or "").strip() for b in (boxes or [])]
+    joined = "".join(t.replace(" ", "") for t in texts)
+    # 领满弹窗特征组合：恭喜获得 + 权益截止 + 无损音质
+    if "恭喜获得" in joined and "权益截止" in joined and "无损音质" in joined:
+        # 再从 joined 里取天数
+        import re as _re
+        m = _re.search(r"第(\d+)日", joined)
+        if m and int(m.group(1)) >= target_days:
+            return f"第{m.group(1)}日畅听"
+    return None
+
+
+def detect_free_listen_entry(boxes) -> Optional[str]:
+    """
+    主循环轻量检测：播放页出现「免费听30天」入口标签 → 命中返回原文，否则 None。
+    用户要求：识别到它就自动暂停（账号已领满，不再进广告、不再反复弹窗/重启App）。
+    只认"免费听30天"完整短语，避免"免费听"泛词误判；不依赖 Activity 名。
+    """
+    for b in boxes or []:
+        t = (b.text or "").replace(" ", "")
+        if "免费听30天" in t:
+            return (b.text or "").strip()
+    return None

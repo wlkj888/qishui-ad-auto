@@ -631,7 +631,8 @@ class App(tk.Tk):
         self.ks_coin_gap_var = tk.StringVar(value="5")       # 只领金币模式：每隔几分钟领一次
         # 汽水模式：自动功能默认关闭，回到纯原版刷广告行为（账号已满30日，自动进广告会"弹窗弹出→收起→又弹"循环）
         self.qs_auto_guide_var = tk.BooleanVar(value=False)   # 不自动进广告（默认关）
-        self.qs_stop_at_30day_var = tk.BooleanVar(value=False) # 不判断30天（默认关）
+        self.qs_stop_at_30day_var = tk.BooleanVar(value=False) # 回查天数并停（默认关）
+        self.qs_auto_pause_full_var = tk.BooleanVar(value=True)  # 识别到播放页「免费听30天」标签就自动暂停（默认开）
         self.qs_check_every_var = tk.StringVar(value="30")   # 每刷多少条广告回查一次
         self.qs_target_days_var = tk.StringVar(value="30")   # 目标畅听天数
         self.qs_frame = None  # 汽水设置区引用，供模式切换显示/隐藏
@@ -784,6 +785,9 @@ class App(tk.Tk):
         ttk.Checkbutton(self.qs_frame, text="启动后自动拉起汽水·进「免费听30天」看广告",
                         variable=self.qs_auto_guide_var,
                         style=self._check_style).pack(fill="x", pady=(0, 4))
+        ttk.Checkbutton(self.qs_frame, text="识别到「免费听30天」标签就自动暂停（账号领满时用）",
+                        variable=self.qs_auto_pause_full_var,
+                        style=self._check_style).pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(self.qs_frame, text="刷满N条广告后回查天数，达到目标自动停止",
                         variable=self.qs_stop_at_30day_var,
                         style=self._check_style).pack(fill="x", pady=(0, 4))
@@ -794,9 +798,8 @@ class App(tk.Tk):
         ttk.Label(qs_row, text="目标(天):").pack(side="left")
         ttk.Entry(qs_row, textvariable=self.qs_target_days_var, width=5).pack(side="left", padx=4)
         ttk.Label(self.qs_frame,
-                  text="默认（两项都不勾）=纯原版刷广告，只自动领奖励/关弹窗，不自动进广告、不判断天数。"
-                       "如需自动进广告流或到目标天数自动停，可自行勾选上面两项；"
-                       "若账号已显示「第30日畅听」，请勿勾第一项，否则会反复弹窗。",
+                  text="默认：不自动进广告；识别到播放页「免费听30天」标签即自动暂停（避免账号领满后反复弹窗/重启App）。"
+                       "若账号还没领满、要自动刷广告，请取消“识别到标签就暂停”，并自行进入广告页后点启动。",
                   foreground="#9aa3b2", wraplength=400).pack(fill="x")
         if "汽水" not in self.mode_var.get():
             self.qs_frame.pack_forget()
@@ -1525,6 +1528,18 @@ class App(tk.Tk):
                 self.msg_q.put(("ocr", focus))
                 self.rounds += 1
 
+                # 【自动暂停】识别到播放页「免费听30天」入口标签 → 自动停止（账号已领满，不再进广告/弹窗/重启App）
+                if getattr(self, "qs_auto_pause_full_var", None) is not None and self.qs_auto_pause_full_var.get():
+                    try:
+                        import qishui_entry
+                        _entry_hit = qishui_entry.detect_free_listen_entry(boxes)
+                        if _entry_hit:
+                            self.msg_q.put(("log", f"识别到「{_entry_hit}」入口标签——账号已领满，自动暂停", "click"))
+                            self.stop_event.set()
+                            break
+                    except Exception:
+                        pass
+
                 # 广告结束页：右上角出现「领取成功 ×」，说明奖励已到账，点叉继续下一个
                 close_box = find_ad_close(boxes, sw, sh)
                 # 弹窗里有「领取奖励/领取」时先领奖，右上角 × 被弹窗挡着，点了也没反应
@@ -1709,12 +1724,14 @@ class App(tk.Tk):
                                     acted = True
                                     break
                             if not acted:
-                                press_back()
-                                time.sleep(1.0)
-                                press_back()
-                                time.sleep(0.8)
-                                relaunch_qishui()
-                                time.sleep(2.2)
+                                # 不再用 monkey 重开 App（会造成"划掉软件→又重开"无限循环）
+                                # 只在确实离开汽水前台时才拉回；停在前台就安静等待
+                                state = qishui_in_front()
+                                if state is False:
+                                    relaunch_qishui()
+                                    time.sleep(1.5)
+                                else:
+                                    self.msg_q.put(("log", "无进展但仍在汽水前台，保持等待（不重启App）", "info"))
                             progress_t = time.time()
                             last_cd = None
                             stuck_n = 0
