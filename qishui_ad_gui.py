@@ -1454,6 +1454,15 @@ class App(tk.Tk):
             )
             live.start()
 
+            # 启动后把汽水拉到前台一次（只是打开App到播放页，不是自动进广告）。
+            # 这样自动暂停检测才能看到播放页的「免费听30天」标签；只拉一次，不做循环重开。
+            try:
+                self.msg_q.put(("log", "拉起汽水音乐到播放页（一次）", "info"))
+                relaunch_qishui()
+                time.sleep(2.5)
+            except Exception:
+                pass
+
             # 预览单独开一条线程，30fps 推最新帧，不受 OCR（每次约 0.5 秒）阻塞
             def _preview_loop():
                 last_seq = -1
@@ -1541,18 +1550,21 @@ class App(tk.Tk):
                     except Exception:
                         pass
 
-                # 前台守卫：被广告落地页带出去才拉回。加连续计数防抖，且不在前台时只拉回一次、不无脑连按返回
-                front = qishui_in_front()
-                if front is False:
+                # 前台守卫：完全改看画面 OCR（焦点会被辅助App抢占而误判，不可靠）。
+                # 只有画面连续多轮既没有汽水元素也没有广告元素（真被带出去）才拉回一次。
+                screen_texts = " ".join((b.text or "") for b in boxes)
+                has_qishui_ui = any(k in screen_texts for k in (
+                    "免费听", "畅听", "领取", "看视频", "看广告", "无损音质",
+                    "开宝箱", "继续观看", "听抖音", "会员", "发现"))
+                if not has_qishui_ui:
                     off_front_n += 1
-                    if off_front_n >= 3:  # 连续 3 轮(~3s)确认离开才动作，避免焦点抖动误判
-                        self.msg_q.put(("log", "确认已离开汽水音乐，拉回一次（不反复重开）", "warn"))
+                    if off_front_n >= 5:  # 连续5轮(~5s)画面都没有汽水元素才拉回
+                        self.msg_q.put(("log", "画面连续多轮无汽水元素，拉回一次（不反复重开）", "warn"))
                         relaunch_qishui()
                         time.sleep(2.0)
                         progress_t = time.time()
                         miss = 0
                         off_front_n = 0
-                    continue
                 else:
                     off_front_n = 0
 
@@ -1844,6 +1856,12 @@ class App(tk.Tk):
 
 def main():
     app = App()
+    # 仅用于自动化验证：带 --autostart 时启动后自动点“启动”（平时双击 App 不带此参数，仍需手动点）
+    if "--autostart" in sys.argv:
+        try:
+            app.after(1500, app.start_bot)
+        except Exception:
+            pass
     app.mainloop()
 
 
