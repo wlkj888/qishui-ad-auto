@@ -629,6 +629,12 @@ class App(tk.Tk):
         self.ks_claim_var = tk.BooleanVar(value=True)       # 是否启用定时领金币
         self.ks_comment_var = tk.BooleanVar(value=False)     # 是否启用随机自动评论
         self.ks_coin_gap_var = tk.StringVar(value="5")       # 只领金币模式：每隔几分钟领一次
+        # 汽水模式：启动自动拉起+进免费听30天广告流；每刷N条广告回查一次天数
+        self.qs_auto_guide_var = tk.BooleanVar(value=True)
+        self.qs_stop_at_30day_var = tk.BooleanVar(value=True)
+        self.qs_check_every_var = tk.StringVar(value="30")   # 每刷多少条广告回查一次
+        self.qs_target_days_var = tk.StringVar(value="30")   # 目标畅听天数
+        self.qs_frame = None  # 汽水设置区引用，供模式切换显示/隐藏
 
         self._build_style()
         self._build_ui()
@@ -773,6 +779,28 @@ class App(tk.Tk):
         self.wifi_status_var = tk.StringVar(value="可先 USB 连接后点「开启无线」，再填手机 IP 连接")
         ttk.Label(wf, textvariable=self.wifi_status_var, wraplength=400, foreground="#9aa3b2").pack(fill="x", pady=(4, 0))
 
+        # 汽水模式设置（选中汽水时显示）
+        self.qs_frame = ttk.LabelFrame(right, text="汽水音乐设置", padding=8)
+        ttk.Checkbutton(self.qs_frame, text="启动后自动拉起汽水·进「免费听30天」看广告",
+                        variable=self.qs_auto_guide_var,
+                        style=self._check_style).pack(fill="x", pady=(0, 4))
+        ttk.Checkbutton(self.qs_frame, text="刷满N条广告后回查天数，达到目标自动停止",
+                        variable=self.qs_stop_at_30day_var,
+                        style=self._check_style).pack(fill="x", pady=(0, 4))
+        qs_row = ttk.Frame(self.qs_frame)
+        qs_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(qs_row, text="每刷(条):").pack(side="left")
+        ttk.Entry(qs_row, textvariable=self.qs_check_every_var, width=5).pack(side="left", padx=(4, 10))
+        ttk.Label(qs_row, text="目标(天):").pack(side="left")
+        ttk.Entry(qs_row, textvariable=self.qs_target_days_var, width=5).pack(side="left", padx=4)
+        ttk.Label(self.qs_frame,
+                  text="流程：自动开汽水→点转发旁「免费听30天」→点「看视频」刷广告；"
+                       "每看1条广告累计1天，每刷N条返回播放页看弹窗天数，到目标天即停。"
+                       "广告里的下载/安装一律不点。",
+                  foreground="#9aa3b2", wraplength=400).pack(fill="x")
+        if "汽水" not in self.mode_var.get():
+            self.qs_frame.pack_forget()
+
         # 快手模式设置（选中快手时显示）
         self.ks_frame = ttk.LabelFrame(right, text="快手设置", padding=8)
         self.ks_rows = {}
@@ -869,6 +897,8 @@ class App(tk.Tk):
             self.log("切换模式：正在停止当前运行，请再点▶启动以切换到新模式", "warn")
             self.stop_bot()
         if self._is_kuaishou():
+            if self.qs_frame is not None:
+                self.qs_frame.pack_forget()
             self.ks_frame.pack(fill="x", pady=(0, 8), before=self._devf)
             if self._is_coin_only():
                 # 只领金币：隐藏刷视频的规则/定时/时段/评论，只留间隔设置
@@ -885,6 +915,8 @@ class App(tk.Tk):
                 self.log("已切到【快手·自动刷作品】：请点▶启动开始刷推荐", "info")
         else:
             self.ks_frame.pack_forget()
+            if self.qs_frame is not None:
+                self.qs_frame.pack(fill="x", pady=(0, 8), before=self._devf)
             self.log("已切到【汽水音乐·去广告】：请点▶启动", "info")
 
     def _on_claim_toggle(self):
@@ -1431,6 +1463,17 @@ class App(tk.Tk):
 
             threading.Thread(target=_preview_loop, daemon=True).start()
 
+            # 【新增·可选】自动拉起汽水 → 点「免费听30天」→ 进「看2个视频」广告流。
+            # 不影响原核心循环；任何一步失败都被捕获，核心脚本照常工作。
+            if getattr(self, "qs_auto_guide_var", None) is not None and self.qs_auto_guide_var.get():
+                try:
+                    import qishui_entry
+                    # 启动只负责进入广告流；天数达成靠"每刷N条回查"，不在启动时直接停
+                    qishui_entry.guide_into_ad_stream(
+                        self, sys.modules[__name__], live, dev_w, dev_h, stop_at_day=0)
+                except Exception as ge:
+                    self.msg_q.put(("log", f"自动引导跳过（不影响刷广告）: {type(ge).__name__}: {ge}", "warn"))
+
             miss = 0
             last_seq = -1
             last_click: dict[tuple, float] = {}
@@ -1439,6 +1482,14 @@ class App(tk.Tk):
             close_since: Optional[float] = None   # 「领取成功 ×」出现的时间，停留几秒再点，避免误点
             stuck_n = 0                            # 连续卡住次数，防止在广告页无限等待
             last_cd: Optional[int] = None           # 上一轮倒计时数字，只有变小才算进展
+            # 【新增】汽水看广告计数：每关闭一个"领取成功×"算看完一条，累计到 N 条回查天数
+            ads_watched = 0
+            last_ad_key = None                     # 防止同一广告的×被重复计数
+            try:
+                check_every = max(1, int(self.qs_check_every_var.get()))
+                target_days = max(1, int(self.qs_target_days_var.get()))
+            except Exception:
+                check_every, target_days = 30, 30
             while not self.stop_event.is_set():
                 frame = live.latest()
                 if frame is None:
@@ -1495,7 +1546,24 @@ class App(tk.Tk):
                         tap(cx, cy)
                         close_since = None
                         progress_t = time.time()
-                        last_click[("关闭×", cx, cy)] = time.time()
+                        ad_key = ("关闭×", cx, cy)
+                        last_click[ad_key] = time.time()
+                        # 一条广告看完计数；累计到 N 条回查播放页天数
+                        if ad_key != last_ad_key:
+                            last_ad_key = ad_key
+                            ads_watched += 1
+                            self.msg_q.put(("log", f"已完成第 {ads_watched} 条广告（每 {check_every} 条回查）", "click"))
+                            if (getattr(self, "qs_stop_at_30day_var", None) is not None
+                                    and self.qs_stop_at_30day_var.get()
+                                    and ads_watched >= check_every):
+                                ads_watched = 0
+                                reach, days = qishui_entry.return_and_check_days(
+                                    self, sys.modules[__name__], live, dev_w, dev_h, target_days)
+                                if reach == "reached":
+                                    self.msg_q.put(("log", f"回查：已到第 {days} 日畅听（目标 {target_days}），自动停止", "click"))
+                                    self.stop_event.set()
+                                    break
+                                progress_t = time.time()
                         time.sleep(1.2)
                         continue
                 else:
