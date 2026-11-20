@@ -295,7 +295,8 @@ def press_back() -> None:
 
 
 def current_focus() -> str:
-    """当前前台窗口（含包名），取不到返回空串。"""
+    """当前前台窗口（含包名），取不到返回空串。
+    优先用 mResumedActivity（真·前台 Activity），华为上 mCurrentFocus 常误报桌面导致反复拉起。"""
     serial = DEVICE_SERIAL
     if not serial:
         try:
@@ -306,9 +307,21 @@ def current_focus() -> str:
                     break
         except Exception:
             serial = None
-    cmd = [ADB] + (["-s", serial] if serial else []) + ["shell", "dumpsys", "window"]
+    base = [ADB] + (["-s", serial] if serial else [])
+    # 优先 mResumedActivity：华为机型 mCurrentFocus 常返回桌面(launcher)导致误判"已离开汽水"→反复拉起
     try:
-        r = subprocess.run(cmd, capture_output=True, timeout=8, **_NO_WINDOW)
+        r = subprocess.run(base + ["shell", "dumpsys", "activity", "activities"],
+                           capture_output=True, timeout=8, **_NO_WINDOW)
+        out = (r.stdout or b"").decode("utf-8", errors="replace")
+        for line in out.splitlines():
+            if "mResumedActivity" in line or "topResumedActivity" in line:
+                return line.strip()
+    except Exception:
+        pass
+    # 回退 mCurrentFocus
+    try:
+        r = subprocess.run(base + ["shell", "dumpsys", "window"],
+                           capture_output=True, timeout=8, **_NO_WINDOW)
         out = (r.stdout or b"").decode("utf-8", errors="replace")
     except Exception:
         return ""
@@ -1484,6 +1497,7 @@ class App(tk.Tk):
             progress_t = time.time()   # 最后一次"有进展"的时间（点击/广告/识别到目标）
             close_since: Optional[float] = None   # 「领取成功 ×」出现的时间，停留几秒再点，避免误点
             stuck_n = 0                            # 连续卡住次数，防止在广告页无限等待
+            off_front_n = 0                        # 连续离开前台次数，防焦点抖动误判反复拉起
             last_cd: Optional[int] = None           # 上一轮倒计时数字，只有变小才算进展
             # 【新增】汽水看广告计数：每关闭一个"领取成功×"算看完一条，累计到 N 条回查天数
             ads_watched = 0
@@ -1508,20 +1522,6 @@ class App(tk.Tk):
                     continue
                 ocr_gap = now
 
-                # 前台守卫：一旦被广告落地页/应用市场带出去，立刻返回并拉回汽水音乐
-                front = qishui_in_front()
-                if front is False:
-                    self.msg_q.put(("log", "已离开汽水音乐（误触广告落地页/应用市场），按返回并拉回", "warn"))
-                    press_back()
-                    time.sleep(0.9)
-                    press_back()
-                    time.sleep(0.6)
-                    relaunch_qishui()
-                    time.sleep(2.0)
-                    progress_t = time.time()
-                    miss = 0
-                    continue
-
                 boxes = run_ocr(frame)
                 sh, sw = frame.shape[:2]
                 focus = filter_focus(boxes, sw, sh)
@@ -1529,6 +1529,7 @@ class App(tk.Tk):
                 self.rounds += 1
 
                 # 【自动暂停】识别到播放页「免费听30天」入口标签 → 自动停止（账号已领满，不再进广告/弹窗/重启App）
+                # 放在前台守卫之前，确保即使焦点误判也能命中并停下
                 if getattr(self, "qs_auto_pause_full_var", None) is not None and self.qs_auto_pause_full_var.get():
                     try:
                         import qishui_entry
@@ -1539,6 +1540,21 @@ class App(tk.Tk):
                             break
                     except Exception:
                         pass
+
+                # 前台守卫：被广告落地页带出去才拉回。加连续计数防抖，且不在前台时只拉回一次、不无脑连按返回
+                front = qishui_in_front()
+                if front is False:
+                    off_front_n += 1
+                    if off_front_n >= 3:  # 连续 3 轮(~3s)确认离开才动作，避免焦点抖动误判
+                        self.msg_q.put(("log", "确认已离开汽水音乐，拉回一次（不反复重开）", "warn"))
+                        relaunch_qishui()
+                        time.sleep(2.0)
+                        progress_t = time.time()
+                        miss = 0
+                        off_front_n = 0
+                    continue
+                else:
+                    off_front_n = 0
 
                 # 广告结束页：右上角出现「领取成功 ×」，说明奖励已到账，点叉继续下一个
                 close_box = find_ad_close(boxes, sw, sh)
