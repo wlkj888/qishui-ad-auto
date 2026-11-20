@@ -6,7 +6,7 @@
 
 | 项目 | 状态 |
 |---|---|
-| 代码 | `~/Doubao/chats/2026-11-20/new-chat/qishui-ad-auto` |
+| 代码 | `/Volumes/wlkj/汽水音乐去广告+快手自动化` |
 | 应用名称 | 汽水快手自动化（窗口标题、Dock 名称、菜单栏一致） |
 | 图标 | `assets/icon_1024.png`（黑底白标单色，只有黑白两色，不是官方彩色版；彩色旧版备份在 `assets/icon_color_1024.png`），已转 `assets/AppIcon.icns` 并打进 .app |
 | .app 包 | `汽水快手自动化.app`（双击即开，带独立图标与名字） |
@@ -23,7 +23,7 @@
 终端启动：
 
 ```bash
-cd ~/Doubao/chats/2026-11-20/new-chat/qishui-ad-auto
+cd /Volumes/wlkj/汽水音乐去广告+快手自动化
 open "汽水快手自动化.app"
 # 直接跑源码：.venv/bin/python qishui_ad_gui.py
 ```
