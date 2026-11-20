@@ -629,9 +629,9 @@ class App(tk.Tk):
         self.ks_claim_var = tk.BooleanVar(value=True)       # 是否启用定时领金币
         self.ks_comment_var = tk.BooleanVar(value=False)     # 是否启用随机自动评论
         self.ks_coin_gap_var = tk.StringVar(value="5")       # 只领金币模式：每隔几分钟领一次
-        # 汽水模式：启动自动拉起+进免费听30天广告流；每刷N条广告回查一次天数
-        self.qs_auto_guide_var = tk.BooleanVar(value=True)
-        self.qs_stop_at_30day_var = tk.BooleanVar(value=True)
+        # 汽水模式：自动功能默认关闭，回到纯原版刷广告行为（账号已满30日，自动进广告会"弹窗弹出→收起→又弹"循环）
+        self.qs_auto_guide_var = tk.BooleanVar(value=False)   # 不自动进广告（默认关）
+        self.qs_stop_at_30day_var = tk.BooleanVar(value=False) # 不判断30天（默认关）
         self.qs_check_every_var = tk.StringVar(value="30")   # 每刷多少条广告回查一次
         self.qs_target_days_var = tk.StringVar(value="30")   # 目标畅听天数
         self.qs_frame = None  # 汽水设置区引用，供模式切换显示/隐藏
@@ -794,9 +794,9 @@ class App(tk.Tk):
         ttk.Label(qs_row, text="目标(天):").pack(side="left")
         ttk.Entry(qs_row, textvariable=self.qs_target_days_var, width=5).pack(side="left", padx=4)
         ttk.Label(self.qs_frame,
-                  text="流程：自动开汽水→点转发旁「免费听30天」→点「看视频」刷广告；"
-                       "每看1条广告累计1天，每刷N条返回播放页看弹窗天数，到目标天即停。"
-                       "广告里的下载/安装一律不点。",
+                  text="默认（两项都不勾）=纯原版刷广告，只自动领奖励/关弹窗，不自动进广告、不判断天数。"
+                       "如需自动进广告流或到目标天数自动停，可自行勾选上面两项；"
+                       "若账号已显示「第30日畅听」，请勿勾第一项，否则会反复弹窗。",
                   foreground="#9aa3b2", wraplength=400).pack(fill="x")
         if "汽水" not in self.mode_var.get():
             self.qs_frame.pack_forget()
