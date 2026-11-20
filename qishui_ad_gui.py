@@ -628,6 +628,7 @@ class App(tk.Tk):
         self.ks_rest_phase_var = tk.StringVar(value="10")   # 领金币后休息分钟
         self.ks_claim_var = tk.BooleanVar(value=True)       # 是否启用定时领金币
         self.ks_comment_var = tk.BooleanVar(value=False)     # 是否启用随机自动评论
+        self.ks_coin_gap_var = tk.StringVar(value="5")       # 只领金币模式：每隔几分钟领一次
 
         self._build_style()
         self._build_ui()
@@ -668,6 +669,43 @@ class App(tk.Tk):
         style.configure("Treeview", background="#2a2c36", fieldbackground="#2a2c36",
                         foreground="#e8e8ef", rowheight=24)
         style.configure("Treeview.Heading", background="#3a3d4a", foreground="#ffffff")
+        # clam 主题默认把选中项画成 "×"，这里换成明确的对勾 "✓"
+        self._build_check_style()
+
+    def _build_check_style(self):
+        """用自绘图片替换 Checkbutton 指示器：未选=空框，选中=绿勾（不用 clam 的叉号）。"""
+        try:
+            import io, base64
+            import tkinter as _tk
+            from PIL import Image, ImageDraw
+
+            def make(checked: bool):
+                img = Image.new("RGBA", (18, 18), (30, 31, 38, 255))
+                d = ImageDraw.Draw(img)
+                d.rectangle([1, 1, 16, 16], outline=(154, 163, 178, 255), width=2)
+                if checked:
+                    d.line([(4, 9), (7, 12), (14, 5)], fill=(74, 222, 128, 255), width=3)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                return _tk.PhotoImage(data=base64.b64encode(buf.getvalue()).decode())
+
+            self._chk_off = make(False)
+            self._chk_on = make(True)
+            style = ttk.Style(self)
+            style.element_create("CheckImg.indicator", "image",
+                                 self._chk_off, ("selected", self._chk_on),
+                                 sticky="")
+            style.layout("Check.TCheckbutton", [
+                ("CheckImg.indicator", {"side": "left", "sticky": ""}),
+                ("Padding", {"width": 4}),
+                ("Checkbutton.label", {"side": "left", "sticky": ""}),
+            ])
+            style.configure("Check.TCheckbutton", background="#1e1f26",
+                            foreground="#e8e8ef", activebackground="#1e1f26",
+                            activeforeground="#ffffff")
+            self._check_style = "Check.TCheckbutton"
+        except Exception:
+            self._check_style = "TCheckbutton"
 
     def _build_ui(self):
         # 顶栏
@@ -680,7 +718,7 @@ class App(tk.Tk):
         ttk.Label(mode_box, text="模式:").pack(side="left")
         self.mode_combo = ttk.Combobox(
             mode_box, state="readonly", width=20,
-            values=["汽水音乐·去广告", "快手·自动刷作品"],
+            values=["汽水音乐·去广告", "快手·自动刷作品", "快手·只领金币"],
             textvariable=self.mode_var,
         )
         self.mode_combo.current(0)
@@ -696,7 +734,8 @@ class App(tk.Tk):
         self.btn_stop = ttk.Button(btns, text="⏹ 停止", command=self.stop_bot, state="disabled")
         self.btn_stop.pack(side="left", padx=4)
         self.screen_off_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btns, text="熄屏运行", variable=self.screen_off_var).pack(side="left", padx=6)
+        ttk.Checkbutton(btns, text="熄屏运行", variable=self.screen_off_var,
+                        style=self._check_style).pack(side="left", padx=6)
         ttk.Button(btns, text="刷新设备", command=self._refresh_device).pack(side="left", padx=4)
         ttk.Button(btns, text="保存截图", command=self._save_shot).pack(side="left", padx=4)
         ttk.Button(btns, text="清空日志", command=self._clear_log).pack(side="left", padx=4)
@@ -736,26 +775,37 @@ class App(tk.Tk):
 
         # 快手模式设置（选中快手时显示）
         self.ks_frame = ttk.LabelFrame(right, text="快手设置", padding=8)
-        ks_row1 = ttk.Frame(self.ks_frame)
-        ks_row1.pack(fill="x", pady=(0, 4))
-        ttk.Label(ks_row1, text="刷视频规则：本条播完（画面停止/红包进度停）才上滑，没播完就一直等",
+        self.ks_rows = {}
+        self.ks_rows["rule"] = ttk.Frame(self.ks_frame)
+        self.ks_rows["rule"].pack(fill="x", pady=(0, 4))
+        ttk.Label(self.ks_rows["rule"], text="刷视频规则：本条播完（画面停止/红包进度停）才上滑，没播完就一直等",
                   foreground="#9aa3b2", wraplength=400).pack(side="left")
-        ks_row2 = ttk.Frame(self.ks_frame)
-        ks_row2.pack(fill="x", pady=(0, 4))
-        ttk.Checkbutton(ks_row2, text="定时领金币循环", variable=self.ks_claim_var,
+        self.ks_rows["timer"] = ttk.Frame(self.ks_frame)
+        self.ks_rows["timer"].pack(fill="x", pady=(0, 4))
+        ttk.Checkbutton(self.ks_rows["timer"], text="定时领金币循环", variable=self.ks_claim_var,
+                        style=self._check_style,
                         command=self._on_claim_toggle).pack(side="left")
-        ks_row3 = ttk.Frame(self.ks_frame)
-        ks_row3.pack(fill="x")
-        ttk.Label(ks_row3, text="刷视频(分):").pack(side="left")
-        self.ks_watch_phase_entry = ttk.Entry(ks_row3, textvariable=self.ks_watch_phase_var, width=5)
+        self.ks_rows["phases"] = ttk.Frame(self.ks_frame)
+        self.ks_rows["phases"].pack(fill="x")
+        ttk.Label(self.ks_rows["phases"], text="刷视频(分):").pack(side="left")
+        self.ks_watch_phase_entry = ttk.Entry(self.ks_rows["phases"], textvariable=self.ks_watch_phase_var, width=5)
         self.ks_watch_phase_entry.pack(side="left", padx=(4, 8))
-        ttk.Label(ks_row3, text="休息(分):").pack(side="left")
-        self.ks_rest_phase_entry = ttk.Entry(ks_row3, textvariable=self.ks_rest_phase_var, width=5)
+        ttk.Label(self.ks_rows["phases"], text="休息(分):").pack(side="left")
+        self.ks_rest_phase_entry = ttk.Entry(self.ks_rows["phases"], textvariable=self.ks_rest_phase_var, width=5)
         self.ks_rest_phase_entry.pack(side="left", padx=4)
-        ks_row4 = ttk.Frame(self.ks_frame)
-        ks_row4.pack(fill="x", pady=(4, 0))
-        ttk.Checkbutton(ks_row4, text="随机自动评论（每刷几条随机发一条常规评论）",
-                        variable=self.ks_comment_var).pack(side="left")
+        self.ks_rows["comment"] = ttk.Frame(self.ks_frame)
+        self.ks_rows["comment"].pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(self.ks_rows["comment"], text="随机自动评论（每刷几条随机发一条常规评论）",
+                        variable=self.ks_comment_var,
+                        style=self._check_style).pack(side="left")
+        # 只领金币模式的间隔设置（仅在选中该模式时显示）
+        self.coin_gap_row = ttk.Frame(self.ks_frame)
+        ttk.Label(self.coin_gap_row, text="每几分钟领一次:").pack(side="left")
+        self.ks_coin_gap_entry = ttk.Entry(self.coin_gap_row,
+                                           textvariable=self.ks_coin_gap_var, width=5)
+        self.ks_coin_gap_entry.pack(side="left", padx=(4, 0))
+        ttk.Label(self.coin_gap_row, text="分钟（只领金币模式用）",
+                  foreground="#9aa3b2").pack(side="left", padx=(4, 0))
         ttk.Label(self.ks_frame, text="播完判定：红包进度环满且停 → 上滑；直播自动跳过；评论需先在手机登录快手",
                   foreground="#9aa3b2", wraplength=400).pack(fill="x", pady=(4, 0))
         if "快手" not in self.mode_var.get():
@@ -810,6 +860,9 @@ class App(tk.Tk):
     def _is_kuaishou(self) -> bool:
         return "快手" in self.mode_var.get()
 
+    def _is_coin_only(self) -> bool:
+        return "只领金币" in self.mode_var.get()
+
     def _on_mode_change(self, _=None):
         """切换模式时显示/隐藏快手设置；运行中则先停止旧 worker，避免两个模式并存抢流。"""
         if self.running or (self.worker is not None and self.worker.is_alive()):
@@ -817,7 +870,19 @@ class App(tk.Tk):
             self.stop_bot()
         if self._is_kuaishou():
             self.ks_frame.pack(fill="x", pady=(0, 8), before=self._devf)
-            self.log("已切到【快手·自动刷作品】：请点▶启动开始刷推荐", "info")
+            if self._is_coin_only():
+                # 只领金币：隐藏刷视频的规则/定时/时段/评论，只留间隔设置
+                for key in ("rule", "timer", "phases", "comment"):
+                    self.ks_rows[key].pack_forget()
+                self.coin_gap_row.pack(fill="x", pady=(4, 0))
+                self.log("已切到【快手·只领金币】：只循环领金币、不刷视频，请点▶启动", "info")
+            else:
+                self.coin_gap_row.pack_forget()
+                self.ks_rows["rule"].pack(fill="x", pady=(0, 4))
+                self.ks_rows["timer"].pack(fill="x", pady=(0, 4))
+                self.ks_rows["phases"].pack(fill="x")
+                self.ks_rows["comment"].pack(fill="x", pady=(4, 0))
+                self.log("已切到【快手·自动刷作品】：请点▶启动开始刷推荐", "info")
         else:
             self.ks_frame.pack_forget()
             self.log("已切到【汽水音乐·去广告】：请点▶启动", "info")
@@ -1196,7 +1261,10 @@ class App(tk.Tk):
         self.btn_start.configure(state="disabled")
         self.btn_stop.configure(state="normal")
         self.status_var.set("运行中…")
-        if self._is_kuaishou():
+        if self._is_coin_only():
+            self.log("启动【快手·只领金币】（不刷视频）", "info")
+            self.worker = threading.Thread(target=self._coin_worker_loop, daemon=True)
+        elif self._is_kuaishou():
             self.log("启动【快手·自动刷作品】（实时影像）", "info")
             self.worker = threading.Thread(target=self._ks_worker_loop, daemon=True)
         else:
@@ -1217,6 +1285,28 @@ class App(tk.Tk):
                 if w.is_alive():
                     self.msg_q.put(("log", "停止超时：运行器仍在退出中，请稍候或重启工具", "err"))
             threading.Thread(target=_wait, daemon=True).start()
+
+    def _coin_worker_loop(self):
+        """只领金币模式的常驻守护：单轮异常自动重连重试。"""
+        import sys as _sys
+        import kuaishou_bot
+        G = _sys.modules[__name__]
+        while not self.stop_event.is_set():
+            try:
+                gap = float(self.ks_coin_gap_var.get() or 5)
+            except Exception:
+                gap = 5.0
+            try:
+                kuaishou_bot.run_coin_only(self, G, interval_min=gap)
+            except Exception as e:
+                self.msg_q.put(("log", f"只领金币运行器异常: {type(e).__name__}: {e}，5 秒后重试", "err"))
+            if self.stop_event.is_set():
+                break
+            self.msg_q.put(("log", "只领金币：5 秒后自动重连继续", "warn"))
+            for _ in range(50):
+                if self.stop_event.is_set():
+                    break
+                time.sleep(0.1)
 
     def _ks_worker_loop(self):
         """快手模式的常驻守护：单轮异常自动重连重试。"""

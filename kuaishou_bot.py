@@ -524,3 +524,176 @@ def run(app, G, watch_seconds: float = DEFAULT_WATCH,
             pass
         if stop.is_set():
             app.msg_q.put(("stopped",))
+
+
+def run_coin_only(app, G, interval_min: float = 5.0) -> None:
+    """
+    独立"只领金币"模式：不刷视频，只周期性领取现成金币。
+
+    每轮：确保快手在视频页 → claim_once → 等 interval 分钟（可被停止打断）→ 下一轮。
+    完全复用 run() 的设备选择 / OCR / LiveScreen / 预览线程基础设施，
+    但不调用也不修改刷视频主循环，互不干扰。
+    """
+    import kuaishou_coin
+    live = None
+    stop = app.stop_event
+    try:
+        interval = float(interval_min or 5.0)
+        interval = max(0.5, min(interval, 240.0))
+        _log(app, f"只领金币模式：每 {interval:.1f} 分钟领一次现成金币，不刷视频", "info")
+
+        # ---- 设备（与 run 一致）----
+        out = G.run_adb_text(["devices"])
+        lines = [ln.strip() for ln in out.splitlines()[1:] if ln.strip()]
+        ready = [ln.split()[0] for ln in lines if ln.endswith("device")]
+        if not ready:
+            host = G.load_wifi_ip()
+            if host:
+                _log(app, f"未发现设备，尝试连接记忆中的 {host}", "warn")
+                G.run_adb_host(["connect", host], timeout=12)
+                time.sleep(1.5)
+                out = G.run_adb_text(["devices"])
+                ready = [ln.split()[0] for ln in out.splitlines()[1:]
+                         if ln.strip() and ln.endswith("device")]
+        if not ready:
+            _log(app, "未检测到已授权设备，请开启 USB 调试 / 连上 WiFi ADB", "err")
+            app.msg_q.put(("stopped",))
+            return
+
+        serial = getattr(G, "DEVICE_SERIAL", None)
+
+        def has_kuaishou(sn: str) -> bool:
+            try:
+                import subprocess
+                r = subprocess.run([G.ADB, "-s", sn, "shell", "pm", "list",
+                                    "packages", KS_PKG],
+                                   capture_output=True, timeout=8)
+                return KS_PKG in (r.stdout or b"").decode("utf-8", errors="replace")
+            except Exception:
+                return False
+
+        chosen = serial if (serial in ready and has_kuaishou(serial)) else None
+        if chosen is None:
+            for sn in ready:
+                if has_kuaishou(sn):
+                    chosen = sn
+                    break
+        if chosen is not None and chosen != serial:
+            _log(app, f"自动切换到装有快手的设备 {chosen}", "warn")
+        serial = chosen or (serial if serial in ready else ready[0])
+        G.DEVICE_SERIAL = serial
+        _log(app, f"目标设备 {serial}", "info")
+
+        dev_w, dev_h = G.get_device_size()
+        G.SCREEN_W, G.SCREEN_H = dev_w, dev_h
+        scale = 0.5 if dev_w >= 1000 else 1.0
+        stream_w = int(dev_w * scale) // 2 * 2
+        stream_h = int(dev_h * scale) // 2 * 2
+        _log(app, f"真机分辨率 {dev_w}x{dev_h} · 影像流 {stream_w}x{stream_h}", "info")
+
+        # ---- OCR / 影像 ----
+        _log(app, "加载 OCR 模型…", "info")
+        G.get_ocr()
+        try:
+            G.run_adb_text(["shell", "svc", "power", "stayon", "true"])
+        except Exception:
+            pass
+        live = G.LiveScreen(
+            G.ADB, serial, size=f"{stream_w}x{stream_h}",
+            on_log=lambda s: app.msg_q.put(("log", s, "info")),
+            screen_off=False,
+        )
+        live.start()
+
+        def _preview_loop():
+            last_seq = -1
+            while not stop.is_set():
+                try:
+                    seq = live.latest_seq()
+                    if seq != last_seq:
+                        frame = live.latest()
+                        if frame is not None:
+                            if app.frame_q.full():
+                                try:
+                                    app.frame_q.get_nowait()
+                                except Exception:
+                                    pass
+                            try:
+                                app.frame_q.put_nowait(frame)
+                            except Exception:
+                                pass
+                            last_seq = seq
+                except Exception:
+                    pass
+                time.sleep(0.012)
+
+        threading.Thread(target=_preview_loop, daemon=True).start()
+
+        # ---- 确保快手在前台 ----
+        focus = G.current_focus()
+        if KS_PKG not in (focus or ""):
+            _log(app, "快手不在前台，正在拉起…", "info")
+            _launch(G)
+            time.sleep(2.5)
+
+        # ---- 领金币循环 ----
+        rounds = 0
+        started_at = time.time()
+        while not stop.is_set():
+            focus = G.current_focus()
+            if KS_PKG not in (focus or ""):
+                _log(app, "已离开快手，重新拉起…", "warn")
+                _launch(G)
+                time.sleep(2.5)
+            focus = G.current_focus()
+            if KS_PKG not in (focus or ""):
+                _log(app, "无法把快手切到前台，20 秒后重试", "err")
+                for _ in range(200):
+                    if stop.is_set():
+                        break
+                    time.sleep(0.1)
+                continue
+
+            kuaishou_coin.claim_once._clicked = set()
+            r = kuaishou_coin.claim_once(app, G, live, dev_w, dev_h)
+            rounds += 1
+            app.rounds += 1
+            detail = (f"第 {rounds} 次领金币（红包{r['big_packet']}/"
+                      f"任务{r['task_claims']}/弹窗{r['popups']}）")
+            _log(app, detail, "info")
+            app.msg_q.put((
+                "stat", app.clicks, app.rounds, time.time() - started_at,
+                f"快手 · 只领金币 · 已领 {rounds} 轮 · {r['coins_hint']}",
+            ))
+
+            # 等待间隔，每 0.5 秒检查停止信号，保证暂停/停止即时生效
+            waited = 0.0
+            while not stop.is_set() and waited < interval * 60:
+                time.sleep(0.5)
+                waited += 0.5
+                if int(waited) % 60 == 0 and int(waited) > 0:
+                    left = (interval * 60 - waited) / 60
+                    _log(app, f"距下次领金币还有 {left:.1f} 分钟", "info")
+
+    except Exception as e:
+        _log(app, f"只领金币模式异常: {type(e).__name__}: {e}", "err")
+    finally:
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                pass
+        try:
+            for _ in range(6):
+                f = G.current_focus() or ""
+                if KS_PKG not in f:
+                    break
+                act = f.lower()
+                if "homeactivity" in act or "photodetailactivity" in act:
+                    break
+                G.press_back()
+                time.sleep(0.5)
+        except Exception:
+            pass
+        if stop.is_set():
+            app.msg_q.put(("stopped",))
