@@ -21,8 +21,12 @@
 
 ## 使用要点
 - 先点界面上的「▶ 启动」才会执行，暂停/停止随时可用。
-- 设备下拉里选对手机：adb 里常有 MI 9（USB）、华为 TAS AN00（WiFi，2026-11-21 起为 192.168.3.74:5555）等多台，选错会去操作别的机。
-  - ⚠️ 华为机的 WiFi IP 是 DHCP 分配的，会变（曾经是 .62，被别的设备抢走后变 .74）。若 WiFi ADB 连不上：先用 USB 连上执行 `adb -s <序列号> shell ip -f inet addr show wlan0 | grep inet` 查当前 IP，再 `adb kill-server && adb connect <新IP>:5555`。
+- 设备下拉里选对手机：**家里有两台华为 TAS-AN00（Mate 30）**，别连错——
+  - 作业机（脚本默认）：`192.168.3.62:5555`
+  - 另一台：`192.168.3.74:5555`（序列号 GCL5T19A26003406）
+  - 另外 adb 里还会出现 MI 9（44ca960b）、小米系设备（65153155600025849）等，都要避开。
+  - ⚠️ 若 `192.168.3.62:5555` 报 `Connection refused`（ping 通、端口拒连）= 那台手机的 adb 无线服务没在跑（重启后 `adb tcpip` 会失效）。处理：把该机用 USB 连上 Mac，执行 `adb -s <序列号> tcpip 5555`，之后无线恢复。
+  - ⚠️ 若 adb 报 `No route to host` 但 `nc -z <ip> 5555` 通，是 adb server 脏状态：`adb kill-server && adb start-server` 后重连。
 - 随机评论依赖开源输入法 ADBKeyboard；华为 TAS AN00 已安装，工具只会在发评论瞬间临时切换并发完还原，不改默认输入法。换手机时若没有该输入法，评论会退化为英文。
 - 详细设置和流程见 `使用说明-双模式.md`；macOS 相关见 `使用说明-macOS.md`。
 
